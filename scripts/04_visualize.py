@@ -152,10 +152,16 @@ def plot_static(skeleton_data: dict, frame_idx: int = 0):
     bounds_min, bounds_max = get_data_bounds(skeleton_data)
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
-    for person_id in range(num_persons):
+    persons = frame.get("persons", [])
+    for person in persons:
+        person_id = person["person_id"]
         pts = extract_points(frame, person_id)
         color = ["tab:blue", "tab:orange"][person_id % 2]
         draw_skeleton(ax, pts, color=color, ms=6)
+    # Legacy single-person format
+    if not persons:
+        pts = extract_points(frame)
+        draw_skeleton(ax, pts, color="tab:blue", ms=6)
 
     ax.set_xlim(bounds_min[0], bounds_max[0])
     ax.set_ylim(bounds_min[1], bounds_max[1])
@@ -163,8 +169,9 @@ def plot_static(skeleton_data: dict, frame_idx: int = 0):
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
+    total_valid = sum(p["num_valid_landmarks"] for p in frame.get("persons", []))
     ax.set_title(f"3D Skeleton — t={frame['timestamp_s']:.2f}s "
-                 f"({frame['num_valid_landmarks']} landmarks)")
+                 f"({total_valid} landmarks, {frame.get('num_persons', 1)} persons)")
 
     output_path = ROOT / "output" / "visualization" / "skeleton_frame.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,14 +214,18 @@ def create_animation(skeleton_data: dict, fps: int = 15):
         ax.clear()
         frame = frames[frame_idx]
         total_valid = 0
-        for person_id in range(num_persons):
+        persons = frame.get("persons", [])
+        for person in persons:
+            person_id = person["person_id"]
             pts = extract_points(frame, person_id)
             color = ["tab:blue", "tab:orange"][person_id % 2]
             draw_skeleton(ax, pts, color=color, ms=5)
-            persons = frame.get("persons", [])
-            for p in persons:
-                if p["person_id"] == person_id:
-                    total_valid += p["num_valid_landmarks"]
+            total_valid += person["num_valid_landmarks"]
+        # Legacy single-person format
+        if not persons:
+            pts = extract_points(frame)
+            draw_skeleton(ax, pts, color="tab:blue", ms=5)
+            total_valid = frame.get("num_valid_landmarks", 0)
 
         ax.set_xlim(bounds_min[0], bounds_max[0])
         ax.set_ylim(bounds_min[1], bounds_max[1])
@@ -308,8 +319,8 @@ def create_overlay(skeleton_data: dict, calibration: dict, cfg: dict,
                     skeleton_frame = skel_frames[nearest_idx]
 
             if skeleton_frame is not None:
-                num_persons = skeleton_frame.get("num_persons", 1)
-                for person_id in range(num_persons):
+                for person in skeleton_frame.get("persons", []):
+                    person_id = person["person_id"]
                     pts_3d = extract_points(skeleton_frame, person_id)
                     valid = ~np.isnan(pts_3d[:, 0])
                     if not valid.any():
@@ -325,6 +336,21 @@ def create_overlay(skeleton_data: dict, calibration: dict, cfg: dict,
                             cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), color, 3)
                     for pt in all_2d.values():
                         cv2.circle(bgr, tuple(pt), 5, (0, 0, 255), -1)
+                # Legacy single-person format fallback
+                if not skeleton_frame.get("persons"):
+                    pts_3d = extract_points(skeleton_frame)
+                    valid = ~np.isnan(pts_3d[:, 0])
+                    if valid.any():
+                        valid_pts = pts_3d[valid].astype(np.float64)
+                        pts_2d, _ = cv2.projectPoints(valid_pts, rvec, T, K, dist)
+                        pts_2d = (pts_2d.reshape(-1, 2) * video_scale).astype(int)
+                        valid_indices = np.where(valid)[0]
+                        all_2d = {vi: pt2d for vi, pt2d in zip(valid_indices, pts_2d)}
+                        for i, j in CONNECTIONS:
+                            if i in all_2d and j in all_2d:
+                                cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), PERSON_COLORS[0], 3)
+                        for pt in all_2d.values():
+                            cv2.circle(bgr, tuple(pt), 5, (0, 0, 255), -1)
 
             small = cv2.resize(bgr, (out_w, out_h))
             out.write(small)
@@ -440,13 +466,13 @@ def create_composite_overlay(skeleton_data: dict, calibration: dict, cfg: dict):
 
             # Build camera panels
             panels = []
-            num_persons_frame = skeleton_frame.get("num_persons", 1) if skeleton_frame else 0
             for cam_id in cam_ids:
                 bgr = bgrs[cam_id]
 
                 if skeleton_frame is not None:
                     cc = cam_calib[cam_id]
-                    for person_id in range(num_persons_frame):
+                    for person in skeleton_frame.get("persons", []):
+                        person_id = person["person_id"]
                         pts_3d = extract_points(skeleton_frame, person_id)
                         valid_mask = ~np.isnan(pts_3d[:, 0])
                         if not valid_mask.any():
@@ -464,6 +490,23 @@ def create_composite_overlay(skeleton_data: dict, calibration: dict, cfg: dict):
                                 cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), color, 4)
                         for pt in all_2d.values():
                             cv2.circle(bgr, tuple(pt), 8, (0, 0, 255), -1)
+                    # Legacy single-person format fallback
+                    if not skeleton_frame.get("persons"):
+                        pts_3d = extract_points(skeleton_frame)
+                        valid_mask = ~np.isnan(pts_3d[:, 0])
+                        if valid_mask.any():
+                            valid_pts = pts_3d[valid_mask].astype(np.float64)
+                            pts_2d, _ = cv2.projectPoints(
+                                valid_pts, cc["rvec"], cc["T"], cc["K"], cc["dist"]
+                            )
+                            pts_2d = (pts_2d.reshape(-1, 2) * video_scale).astype(int)
+                            valid_indices = np.where(valid_mask)[0]
+                            all_2d = {vi: pt2d for vi, pt2d in zip(valid_indices, pts_2d)}
+                            for i, j in CONNECTIONS:
+                                if i in all_2d and j in all_2d:
+                                    cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), PERSON_COLORS[0], 4)
+                            for pt in all_2d.values():
+                                cv2.circle(bgr, tuple(pt), 8, (0, 0, 255), -1)
 
                 panel = cv2.resize(bgr, (panel_w, panel_h))
                 cv2.putText(panel, cam_id.upper(), (10, 30),
