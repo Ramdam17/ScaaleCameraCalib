@@ -27,6 +27,12 @@ from matplotlib.animation import FuncAnimation
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Per-person colors: BGR
+PERSON_COLORS = [
+    (0, 255, 0),      # person 0: green
+    (0, 165, 255),    # person 1: orange
+]
+
 # MediaPipe POSE_CONNECTIONS (subset of the 33 landmarks that form skeleton edges)
 CONNECTIONS = [
     # Torso
@@ -66,23 +72,40 @@ def load_calibration() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def extract_points(frame: dict) -> np.ndarray:
-    """Extract (33, 3) array from a frame. NaN for missing landmarks."""
+def extract_points(frame: dict, person_id: int = 0) -> np.ndarray:
+    """Extract (33, 3) array for one person from a frame. NaN for missing landmarks."""
     pts = np.full((33, 3), np.nan)
-    for lm in frame["landmarks"]:
-        if lm["x"] is not None:
-            pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
+    # New multi-person format: frame["persons"][i]["landmarks"]
+    persons = frame.get("persons")
+    if persons is not None:
+        for person in persons:
+            if person["person_id"] == person_id:
+                for lm in person["landmarks"]:
+                    if lm["x"] is not None:
+                        pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
+                break
+    else:
+        # Legacy single-person format: frame["landmarks"]
+        for lm in frame.get("landmarks", []):
+            if lm["x"] is not None:
+                pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
     return pts
 
 
+def get_num_persons(skeleton_data: dict) -> int:
+    return skeleton_data.get("num_persons", 1)
+
+
 def get_data_bounds(skeleton_data: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Get min/max bounds across all valid frames for consistent axis limits."""
+    """Get min/max bounds across all valid frames and all persons."""
+    num_persons = get_num_persons(skeleton_data)
     all_pts = []
     for frame in skeleton_data["frames"]:
-        pts = extract_points(frame)
-        valid = pts[~np.isnan(pts[:, 0])]
-        if len(valid) > 0:
-            all_pts.append(valid)
+        for person_id in range(num_persons):
+            pts = extract_points(frame, person_id)
+            valid = pts[~np.isnan(pts[:, 0])]
+            if len(valid) > 0:
+                all_pts.append(valid)
     if not all_pts:
         return np.array([-1, -1, -1]), np.array([1, 1, 1])
     all_pts = np.vstack(all_pts)
@@ -111,22 +134,28 @@ def draw_skeleton(ax, pts: np.ndarray, color="tab:blue", lw=2, ms=4, flip_z=True
 
 
 def plot_static(skeleton_data: dict, frame_idx: int = 0):
-    """Plot a single frame's 3D skeleton."""
-    # Find a frame with enough landmarks
+    """Plot a single frame's 3D skeleton (all persons)."""
+    num_persons = get_num_persons(skeleton_data)
+    # Find a frame with enough landmarks across any person
     for i in range(frame_idx, len(skeleton_data["frames"])):
         frame = skeleton_data["frames"][i]
-        if frame["num_valid_landmarks"] >= 10:
+        persons = frame.get("persons", [])
+        if any(p["num_valid_landmarks"] >= 10 for p in persons):
+            break
+        # Legacy format
+        if frame.get("num_valid_landmarks", 0) >= 10:
             break
     else:
         print("No frame with enough landmarks found.")
         return
 
-    pts = extract_points(frame)
     bounds_min, bounds_max = get_data_bounds(skeleton_data)
-
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
-    draw_skeleton(ax, pts, ms=6)
+    for person_id in range(num_persons):
+        pts = extract_points(frame, person_id)
+        color = ["tab:blue", "tab:orange"][person_id % 2]
+        draw_skeleton(ax, pts, color=color, ms=6)
 
     ax.set_xlim(bounds_min[0], bounds_max[0])
     ax.set_ylim(bounds_min[1], bounds_max[1])
@@ -164,6 +193,8 @@ def create_animation(skeleton_data: dict, fps: int = 15):
     frame_count_ref = [0]
     t0 = time.time()
 
+    num_persons = get_num_persons(skeleton_data)
+
     def update(frame_idx):
         frame_count_ref[0] += 1
         if frame_count_ref[0] % 50 == 0:
@@ -175,8 +206,15 @@ def create_animation(skeleton_data: dict, fps: int = 15):
 
         ax.clear()
         frame = frames[frame_idx]
-        pts = extract_points(frame)
-        draw_skeleton(ax, pts, ms=5)
+        total_valid = 0
+        for person_id in range(num_persons):
+            pts = extract_points(frame, person_id)
+            color = ["tab:blue", "tab:orange"][person_id % 2]
+            draw_skeleton(ax, pts, color=color, ms=5)
+            persons = frame.get("persons", [])
+            for p in persons:
+                if p["person_id"] == person_id:
+                    total_valid += p["num_valid_landmarks"]
 
         ax.set_xlim(bounds_min[0], bounds_max[0])
         ax.set_ylim(bounds_min[1], bounds_max[1])
@@ -185,9 +223,8 @@ def create_animation(skeleton_data: dict, fps: int = 15):
         ax.set_ylabel("Y (m)")
         ax.set_zlabel("Z (m)")
         ax.set_title(f"t={frame['timestamp_s']:.2f}s — "
-                     f"{frame['num_valid_landmarks']} landmarks, "
+                     f"{total_valid} landmarks, {frame.get('num_persons', 1)} persons, "
                      f"{frame['num_cameras_used']} cams")
-        # Slow orbit
         ax.view_init(elev=20, azim=30 + frame_idx * 0.5)
 
     anim = FuncAnimation(fig, update, frames=len(frames), interval=1000 / fps)
@@ -271,28 +308,21 @@ def create_overlay(skeleton_data: dict, calibration: dict, cfg: dict,
                     skeleton_frame = skel_frames[nearest_idx]
 
             if skeleton_frame is not None:
-                pts_3d = extract_points(skeleton_frame)
-                valid = ~np.isnan(pts_3d[:, 0])
-
-                if valid.any():
+                num_persons = skeleton_frame.get("num_persons", 1)
+                for person_id in range(num_persons):
+                    pts_3d = extract_points(skeleton_frame, person_id)
+                    valid = ~np.isnan(pts_3d[:, 0])
+                    if not valid.any():
+                        continue
+                    color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
                     valid_pts = pts_3d[valid].astype(np.float64)
                     pts_2d, _ = cv2.projectPoints(valid_pts, rvec, T, K, dist)
-                    # K projects to calib resolution → scale to video resolution
                     pts_2d = (pts_2d.reshape(-1, 2) * video_scale).astype(int)
-
-                    # Map back to full landmark indices
                     valid_indices = np.where(valid)[0]
-                    all_2d = {}
-                    for vi, pt2d in zip(valid_indices, pts_2d):
-                        all_2d[vi] = pt2d
-
-                    # Draw connections
+                    all_2d = {vi: pt2d for vi, pt2d in zip(valid_indices, pts_2d)}
                     for i, j in CONNECTIONS:
                         if i in all_2d and j in all_2d:
-                            cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]),
-                                     (0, 255, 0), 3)
-
-                    # Draw keypoints
+                            cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), color, 3)
                     for pt in all_2d.values():
                         cv2.circle(bgr, tuple(pt), 5, (0, 0, 255), -1)
 
@@ -408,39 +438,32 @@ def create_composite_overlay(skeleton_data: dict, calibration: dict, cfg: dict):
                 if abs(skel_timestamps[nearest_idx] - ref_synced_ts) < 0.1:
                     skeleton_frame = skel_frames[nearest_idx]
 
-            # Extract 3D points
-            pts_3d = None
-            valid_mask = None
-            if skeleton_frame is not None:
-                pts_3d = extract_points(skeleton_frame)
-                valid_mask = ~np.isnan(pts_3d[:, 0])
-
             # Build camera panels
             panels = []
+            num_persons_frame = skeleton_frame.get("num_persons", 1) if skeleton_frame else 0
             for cam_id in cam_ids:
                 bgr = bgrs[cam_id]
 
-                # Reproject skeleton onto this camera
-                if pts_3d is not None and valid_mask.any():
+                if skeleton_frame is not None:
                     cc = cam_calib[cam_id]
-                    valid_pts = pts_3d[valid_mask].astype(np.float64)
-                    pts_2d, _ = cv2.projectPoints(
-                        valid_pts, cc["rvec"], cc["T"], cc["K"], cc["dist"]
-                    )
-                    # K projects to calib resolution → scale to video resolution
-                    pts_2d = (pts_2d.reshape(-1, 2) * video_scale).astype(int)
-
-                    valid_indices = np.where(valid_mask)[0]
-                    all_2d = {}
-                    for vi, pt2d in zip(valid_indices, pts_2d):
-                        all_2d[vi] = pt2d
-
-                    for i, j in CONNECTIONS:
-                        if i in all_2d and j in all_2d:
-                            cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]),
-                                     (0, 255, 0), 4)
-                    for pt in all_2d.values():
-                        cv2.circle(bgr, tuple(pt), 8, (0, 0, 255), -1)
+                    for person_id in range(num_persons_frame):
+                        pts_3d = extract_points(skeleton_frame, person_id)
+                        valid_mask = ~np.isnan(pts_3d[:, 0])
+                        if not valid_mask.any():
+                            continue
+                        color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
+                        valid_pts = pts_3d[valid_mask].astype(np.float64)
+                        pts_2d, _ = cv2.projectPoints(
+                            valid_pts, cc["rvec"], cc["T"], cc["K"], cc["dist"]
+                        )
+                        pts_2d = (pts_2d.reshape(-1, 2) * video_scale).astype(int)
+                        valid_indices = np.where(valid_mask)[0]
+                        all_2d = {vi: pt2d for vi, pt2d in zip(valid_indices, pts_2d)}
+                        for i, j in CONNECTIONS:
+                            if i in all_2d and j in all_2d:
+                                cv2.line(bgr, tuple(all_2d[i]), tuple(all_2d[j]), color, 4)
+                        for pt in all_2d.values():
+                            cv2.circle(bgr, tuple(pt), 8, (0, 0, 255), -1)
 
                 panel = cv2.resize(bgr, (panel_w, panel_h))
                 cv2.putText(panel, cam_id.upper(), (10, 30),
@@ -455,9 +478,14 @@ def create_composite_overlay(skeleton_data: dict, calibration: dict, cfg: dict):
                 skel3d_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
 
             # Add metrics overlay on skeleton panel
-            num_valid = skeleton_frame["num_valid_landmarks"] if skeleton_frame else 0
-            num_cams = skeleton_frame["num_cameras_used"] if skeleton_frame else 0
-            cv2.putText(skel3d_panel, f"t={ref_synced_ts:.2f}s  {num_valid}/33 lm  {num_cams} cams",
+            if skeleton_frame is not None:
+                num_valid = sum(p["num_valid_landmarks"] for p in skeleton_frame.get("persons", []))
+                num_cams = skeleton_frame["num_cameras_used"]
+                n_persons = skeleton_frame.get("num_persons", 1)
+            else:
+                num_valid = num_cams = n_persons = 0
+            cv2.putText(skel3d_panel,
+                        f"t={ref_synced_ts:.2f}s  {num_valid}lm  {n_persons}p  {num_cams}cams",
                         (10, panel_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (200, 200, 200), 1)
 

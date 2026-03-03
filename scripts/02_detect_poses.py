@@ -353,11 +353,16 @@ def main():
         print(f"  Started process for {cam_ids[processes.index(p)]}")
 
     # Drain queue BEFORE join() to avoid pipe deadlock
+    num_persons = cfg["pose_detection"]["num_poses"]
     for _ in cam_ids:
         stats = result_queue.get()
         cam_id = stats["cam_id"]
-        print(f"\n[{cam_id}] {stats['n_frames']} frames, avg {stats['avg_poses']:.1f} persons/frame")
-        print(f"  Pose distribution: {stats['pose_distribution']}")
+        dist = stats["pose_distribution"]
+        # Frames where all expected persons are detected
+        full_det = dist.get(num_persons, 0)
+        full_pct = 100 * full_det // max(1, stats["n_frames"])
+        print(f"\n[{cam_id}] {stats['n_frames']} frames | avg {stats['avg_poses']:.2f}/{num_persons} persons")
+        print(f"  Distribution: {dist} | {full_pct}% frames with {num_persons} persons")
         print(f"  Saved to {stats['out_path']}")
 
     for p in processes:

@@ -47,12 +47,29 @@ def load_calibration() -> dict:
         return json.load(f)
 
 
-def extract_points(frame: dict) -> np.ndarray:
-    """Extract (33, 3) array from a skeleton frame. NaN for missing landmarks."""
+# Per-person arrow colors: BGR
+PERSON_COLORS = [
+    (0, 0, 255),      # person 0: red arrow
+    (0, 165, 255),    # person 1: orange arrow
+]
+
+
+def extract_points(frame: dict, person_id: int = 0) -> np.ndarray:
+    """Extract (33, 3) array for one person from a skeleton frame. NaN for missing."""
     pts = np.full((33, 3), np.nan)
-    for lm in frame["landmarks"]:
-        if lm["x"] is not None:
-            pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
+    persons = frame.get("persons")
+    if persons is not None:
+        for person in persons:
+            if person["person_id"] == person_id:
+                for lm in person["landmarks"]:
+                    if lm["x"] is not None:
+                        pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
+                break
+    else:
+        # Legacy single-person format
+        for lm in frame.get("landmarks", []):
+            if lm["x"] is not None:
+                pts[lm["id"]] = [lm["x"], lm["y"], lm["z"]]
     return pts
 
 
@@ -241,10 +258,16 @@ def main():
         str(output_dir / "gaze_overlay.mp4"), fourcc, target_fps, (out_w, out_h)
     )
 
+    num_persons = skeleton_data.get("num_persons", 1)
+    print(f"  {num_persons} person(s) in skeleton data\n")
+
+    font_scale = max(1.0, video_scale * 0.6)
+    thickness = max(2, int(video_scale * 2))
+
     # Process frames
     results = []
     frame_count = 0
-    valid_pose_count = 0
+    valid_pose_counts = [0] * num_persons
     frame_pos = 0
     t0 = time.time()
 
@@ -267,42 +290,47 @@ def main():
                 "frame_index": frame_pos,
                 "timestamp_s": round(frame_pos / source_fps, 4),
                 "synced_ts": round(synced_ts, 4),
-                "head_pose_valid": False,
+                "persons": [],
             }
 
             if skeleton_frame is not None:
-                pts = extract_points(skeleton_frame)
-                head_pose = compute_head_pose_3d(pts)
+                for person_id in range(num_persons):
+                    pts = extract_points(skeleton_frame, person_id)
+                    head_pose = compute_head_pose_3d(pts)
+                    color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
 
-                if head_pose is not None:
-                    valid_pose_count += 1
-                    entry.update({
-                        "head_pose_valid": True,
-                        "yaw_deg": head_pose["yaw_deg"],
-                        "pitch_deg": head_pose["pitch_deg"],
-                        "roll_deg": head_pose["roll_deg"],
-                    })
+                    person_entry = {"person_id": person_id, "head_pose_valid": False}
 
-                    # Project and draw gaze arrow
-                    nose_px, gaze_px = project_gaze_arrow(
-                        pts, head_pose, K, dist, R_cam, T_cam,
-                        video_scale=video_scale, arrow_len_m=0.3,
-                    )
-                    if nose_px is not None and gaze_px is not None:
-                        cv2.arrowedLine(bgr, nose_px, gaze_px,
-                                        (0, 0, 255), max(3, int(video_scale * 3)),
-                                        tipLength=0.3)
+                    if head_pose is not None:
+                        valid_pose_counts[person_id] += 1
+                        person_entry.update({
+                            "head_pose_valid": True,
+                            "yaw_deg": head_pose["yaw_deg"],
+                            "pitch_deg": head_pose["pitch_deg"],
+                            "roll_deg": head_pose["roll_deg"],
+                        })
 
-                    # Text at video scale
-                    font_scale = max(1.0, video_scale * 0.6)
-                    thickness = max(2, int(video_scale * 2))
-                    cv2.putText(bgr,
-                                f"Yaw:{head_pose['yaw_deg']:.0f}  "
-                                f"Pitch:{head_pose['pitch_deg']:.0f}  "
-                                f"Roll:{head_pose['roll_deg']:.0f}",
-                                (int(30 * video_scale), int(80 * video_scale)),
-                                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                                (0, 0, 255), thickness)
+                        # Project and draw gaze arrow
+                        nose_px, gaze_px = project_gaze_arrow(
+                            pts, head_pose, K, dist, R_cam, T_cam,
+                            video_scale=video_scale, arrow_len_m=0.3,
+                        )
+                        if nose_px is not None and gaze_px is not None:
+                            cv2.arrowedLine(bgr, nose_px, gaze_px, color,
+                                            max(3, int(video_scale * 3)), tipLength=0.3)
+
+                        # Text: stagger vertically per person
+                        y_offset = int((80 + person_id * 60) * video_scale)
+                        cv2.putText(
+                            bgr,
+                            f"P{person_id} Yaw:{head_pose['yaw_deg']:.0f} "
+                            f"Pitch:{head_pose['pitch_deg']:.0f} "
+                            f"Roll:{head_pose['roll_deg']:.0f}",
+                            (int(30 * video_scale), y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness,
+                        )
+
+                    entry["persons"].append(person_entry)
 
             results.append(entry)
             small = cv2.resize(bgr, (out_w, out_h))
@@ -314,8 +342,11 @@ def main():
                 fps = frame_count / max(elapsed, 0.01)
                 remaining = (expected - frame_count) / max(fps, 0.01)
                 pct = 100 * frame_count // expected
+                valid_str = " ".join(
+                    f"P{i}:{valid_pose_counts[i]}" for i in range(num_persons)
+                )
                 print(f"  {frame_count}/{expected} ({pct}%) "
-                      f"| {valid_pose_count} valid | {fps:.1f} fr/s "
+                      f"| valid={valid_str} | {fps:.1f} fr/s "
                       f"| ~{remaining:.0f}s left", flush=True)
 
         frame_pos += 1
@@ -325,18 +356,19 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\nProcessed {frame_count} frames in {elapsed:.1f}s")
-    print(f"Head pose: {valid_pose_count}/{frame_count} valid "
-          f"({100*valid_pose_count//max(frame_count,1)}%)")
-    print(f"Overlay: {output_dir/'gaze_overlay.mp4'}")
+    for i in range(num_persons):
+        pct = 100 * valid_pose_counts[i] // max(frame_count, 1)
+        print(f"  Person {i}: {valid_pose_counts[i]}/{frame_count} valid ({pct}%)")
+    print(f"Overlay: {output_dir / 'gaze_overlay.mp4'}")
 
     # Save JSON
     output = {
         "method": "3d_skeleton_head_orientation",
         "camera": cam_id,
         "coordinate_system": "cam01_origin",
+        "num_persons": num_persons,
         "total_frames": len(results),
-        "valid_poses": valid_pose_count,
-        "validation_rate": round(valid_pose_count / max(len(results), 1), 4),
+        "valid_poses_per_person": valid_pose_counts,
         "frames": results,
     }
     json_path = output_dir / "gaze.json"

@@ -2,15 +2,15 @@
   "cameras": {
     "cam01": {
       "calibration_video": "data/01/0101.MP4",
-      "skeleton_video": "data/01/0102.MP4"
+      "skeleton_video": "data/01/0103.MP4"
     },
     "cam02": {
       "calibration_video": "data/02/0201.MP4",
-      "skeleton_video": "data/02/0202.MP4"
+      "skeleton_video": "data/02/0203.MP4"
     },
     "cam03": {
       "calibration_video": "data/03/0301.MP4",
-      "skeleton_video": "data/03/0302.MP4"
+      "skeleton_video": "data/03/0303.MP4"
     }
   },
   "charuco": {
@@ -28,7 +28,7 @@
   },
   "pose_detection": {
     "subsample_fps": 15,
-    "num_poses": 1,
+    "num_poses": 2,
     "min_detection_confidence": 0.5,
     "min_tracking_confidence": 0.5,
     "model_path": "models/pose_landmarker_lite.task",
