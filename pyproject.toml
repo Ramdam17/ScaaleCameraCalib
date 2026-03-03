@@ -1,0 +1,23 @@
+[project]
+name = "cameracalib"
+version = "0.1.0"
+description = "Multi-camera 3D skeleton tracking pipeline"
+authors = [
+    {name = "Ramdam17",email = "remy.ramadour.labs@gmail.com"}
+]
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-contrib-python>=4.10.0",
+    "mediapipe>=0.10.18",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "matplotlib>=3.9",
+]
+
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

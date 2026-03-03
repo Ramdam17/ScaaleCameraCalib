@@ -1,0 +1,52 @@
+{
+  "cameras": {
+    "cam01": {
+      "calibration_video": "data/01/0101.MP4",
+      "skeleton_video": "data/01/0102.MP4"
+    },
+    "cam02": {
+      "calibration_video": "data/02/0201.MP4",
+      "skeleton_video": "data/02/0202.MP4"
+    },
+    "cam03": {
+      "calibration_video": "data/03/0301.MP4",
+      "skeleton_video": "data/03/0302.MP4"
+    }
+  },
+  "charuco": {
+    "squares_x": 5,
+    "squares_y": 7,
+    "square_length_m": 0.033,
+    "marker_length_m": 0.0165,
+    "dictionary": "DICT_6X6_250"
+  },
+  "calibration": {
+    "frame_subsample_fps": 30,
+    "min_corners_per_frame": 8,
+    "max_frames_per_camera": 50,
+    "downscale_width": 1920
+  },
+  "pose_detection": {
+    "subsample_fps": 15,
+    "num_poses": 1,
+    "min_detection_confidence": 0.5,
+    "min_tracking_confidence": 0.5,
+    "model_path": "models/pose_landmarker_lite.task",
+    "downscale_width": 1920
+  },
+  "triangulation": {
+    "min_cameras_per_point": 2,
+    "max_reprojection_error_px": 50.0,
+    "confidence_threshold": 0.5
+  },
+  "gaze_estimation": {
+    "model_path": "models/face_landmarker.task",
+    "camera": "cam01",
+    "downscale_width": 1920,
+    "subsample_fps": 15,
+    "min_face_detection_confidence": 0.5,
+    "min_tracking_confidence": 0.5,
+    "gaze_arrow_length_px": 200
+  },
+  "output_dir": "output"
+}
