@@ -1,9 +1,11 @@
 """
-02_detect_poses.py — 2D pose detection with MediaPipe + audio synchronization.
+02_detect_poses.py — 2D pose detection with YOLO + MediaPipe + audio sync.
 
-Steps:
+Strategy:
   1. Compute audio-based temporal sync offsets between cameras
-  2. Detect 2D poses (up to 2 people) per camera using MediaPipe Pose Landmarker
+  2. For each frame:
+     a. YOLO detects person bounding boxes (reliable multi-person)
+     b. MediaPipe Pose runs single-person on each cropped person (33 landmarks)
   3. Save per-camera pose data as JSON
 
 Usage:
@@ -14,13 +16,13 @@ import json
 import subprocess
 import sys
 import time
-from multiprocessing import Process, Queue
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
 from scipy.signal import fftconvolve
+from ultralytics import YOLO
 
 # Force unbuffered stdout so progress prints appear immediately in subprocesses
 sys.stdout.reconfigure(line_buffering=True)
@@ -122,17 +124,22 @@ def compute_sync_offsets(cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Pose detection
+# Pose detection (YOLO + MediaPipe hybrid)
 # ---------------------------------------------------------------------------
+
+YOLO_MODEL = "yolov8m.pt"  # medium — reliable person detection at all angles
+YOLO_PERSON_CLASS = 0      # COCO class 0 = person
+YOLO_CONF = 0.25           # Minimum confidence for person detection
+BBOX_PAD = 0.25            # Expand bbox by 25% on each side for better pose
 
 
 def create_pose_detector(cfg_pose: dict):
-    """Create MediaPipe PoseLandmarker from pose_detection config section."""
+    """Create single-person MediaPipe PoseLandmarker (IMAGE mode for crops)."""
     model_path = str(ROOT / cfg_pose["model_path"])
     options = mp.tasks.vision.PoseLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO,
-        num_poses=cfg_pose["num_poses"],
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_poses=1,
         min_pose_detection_confidence=cfg_pose["min_detection_confidence"],
         min_tracking_confidence=cfg_pose["min_tracking_confidence"],
         output_segmentation_masks=False,
@@ -140,14 +147,26 @@ def create_pose_detector(cfg_pose: dict):
     return mp.tasks.vision.PoseLandmarker.create_from_options(options)
 
 
-def detect_poses_in_video(
-    landmarker, video_path: str, target_fps: float, sync_offset: float,
-    cam_id: str = "", downscale_width: int | None = None,
-) -> dict:
-    """Detect 2D poses in a video at target_fps using sequential read (no seeking).
+def expand_bbox(x1: int, y1: int, x2: int, y2: int,
+                img_w: int, img_h: int, pad: float = BBOX_PAD):
+    """Expand bounding box by `pad` fraction on each side, clamped to image."""
+    bw, bh = x2 - x1, y2 - y1
+    dx, dy = int(bw * pad), int(bh * pad)
+    return max(0, x1 - dx), max(0, y1 - dy), min(img_w, x2 + dx), min(img_h, y2 + dy)
 
-    Sequential read avoids H.264 keyframe-seek overhead (4-5× faster than cap.set).
-    Landmarks are normalized [0,1] and scaled back to original resolution.
+
+def detect_poses_in_video(
+    yolo_model, landmarker, video_path: str, target_fps: float,
+    sync_offset: float, cam_id: str = "",
+    downscale_width: int | None = None, num_poses: int = 2,
+) -> dict:
+    """Detect 2D poses using YOLO (person boxes) + MediaPipe (33 landmarks per crop).
+
+    For each frame:
+      1. YOLO detects person bounding boxes on the full (possibly downscaled) frame
+      2. Top `num_poses` detections are cropped
+      3. MediaPipe single-person runs on each crop → 33 landmarks
+      4. Landmarks are mapped back to full-frame coordinates
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -166,10 +185,12 @@ def detect_poses_in_video(
 
     # Resolution used for detection (= calibration coordinate system)
     if downscale_width and w > downscale_width:
-        lm_w = downscale_width
-        lm_h = int(h * downscale_width / w)
+        det_w = downscale_width
+        det_h = int(h * downscale_width / w)
+        det_scale = downscale_width / w
     else:
-        lm_w, lm_h = w, h
+        det_w, det_h = w, h
+        det_scale = 1.0
 
     frames_data = []
     processed = 0
@@ -182,32 +203,55 @@ def detect_poses_in_video(
             break
 
         if frame_pos % step == 0:
-            # Optionally downscale for faster inference
-            if downscale_width and w > downscale_width:
-                scale = downscale_width / w
-                small = cv2.resize(bgr, (downscale_width, int(h * scale)))
-                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            # Downscale for detection
+            if det_scale < 1.0:
+                small = cv2.resize(bgr, (det_w, det_h))
             else:
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                small = bgr
 
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
-            # Timestamps: computed from frame_pos for monotonically increasing guarantee
             timestamp_s = frame_pos / source_fps
             synced_timestamp_s = timestamp_s + sync_offset
-            timestamp_ms = int(timestamp_s * 1000)
 
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            # --- Step 1: YOLO person detection (pass BGR — ultralytics expects it) ---
+            yolo_results = yolo_model(small, verbose=False, classes=[YOLO_PERSON_CLASS],
+                                       conf=YOLO_CONF)
+            boxes = yolo_results[0].boxes
+            # Sort by confidence descending, keep top num_poses
+            if boxes is not None and len(boxes) > 0:
+                confs = boxes.conf.cpu().numpy()
+                sorted_indices = np.argsort(-confs)[:num_poses]
+                person_boxes = boxes.xyxy.cpu().numpy()[sorted_indices].astype(int)
+            else:
+                person_boxes = np.empty((0, 4), dtype=int)
 
-            # Landmarks are normalized [0,1] — scale to detection resolution
-            # (matches calibration coordinate system when downscale_width is used)
+            # --- Step 2: MediaPipe single-person on each crop ---
             poses = []
-            for i, landmarks in enumerate(result.pose_landmarks):
+            for pi, (bx1, by1, bx2, by2) in enumerate(person_boxes):
+                # Expand bbox and crop
+                ex1, ey1, ex2, ey2 = expand_bbox(bx1, by1, bx2, by2, det_w, det_h)
+                crop = rgb[ey1:ey2, ex1:ex2]
+                if crop.size == 0:
+                    continue
+                # MediaPipe requires contiguous memory layout
+                crop = np.ascontiguousarray(crop)
+                crop_h, crop_w = crop.shape[:2]
+
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop)
+                result = landmarker.detect(mp_image)
+
+                if not result.pose_landmarks:
+                    continue
+
+                # Take first (only) detected pose in crop
+                landmarks = result.pose_landmarks[0]
                 lm_data = []
                 xs, ys = [], []
                 for j, lm in enumerate(landmarks):
-                    px = lm.x * lm_w
-                    py = lm.y * lm_h
+                    # Map from crop-normalized [0,1] back to full-frame pixels
+                    px = lm.x * crop_w + ex1
+                    py = lm.y * crop_h + ey1
                     lm_data.append({
                         "id": j,
                         "name": LANDMARK_NAMES[j],
@@ -231,7 +275,7 @@ def detect_poses_in_video(
                     }
 
                 poses.append({
-                    "person_index": i,
+                    "person_index": pi,
                     "landmarks": lm_data,
                     "bounding_box": bbox,
                 })
@@ -266,47 +310,10 @@ def detect_poses_in_video(
     return {
         "source_fps": source_fps,
         "detection_fps": target_fps,
-        "image_size": [lm_w, lm_h],
+        "image_size": [det_w, det_h],
         "total_frames_processed": processed,
         "frames": frames_data,
     }
-
-
-# ---------------------------------------------------------------------------
-# Parallel worker
-# ---------------------------------------------------------------------------
-
-
-def _pose_worker(cam_id, video_path, cfg_pose, sync_offset, output_dir_str, result_queue):
-    """Runs in a separate process: detect poses for one camera, save JSON."""
-    sys.stdout.reconfigure(line_buffering=True)
-    landmarker = create_pose_detector(cfg_pose)
-    downscale = cfg_pose.get("downscale_width")
-    result = detect_poses_in_video(
-        landmarker, video_path, cfg_pose["subsample_fps"],
-        sync_offset, cam_id=cam_id, downscale_width=downscale,
-    )
-    landmarker.close()
-    result["camera_id"] = cam_id
-    result["video_path"] = video_path
-    result["sync_offset_s"] = sync_offset
-
-    # Save JSON inside the worker — avoids sending large payload through queue
-    out_path = Path(output_dir_str) / f"{cam_id}_poses.json"
-    with open(out_path, "w") as f:
-        json.dump(result, f)
-
-    # Only send lightweight stats through queue
-    n_frames = result["total_frames_processed"]
-    pose_counts = [fr["num_poses"] for fr in result["frames"]]
-    result_queue.put({
-        "cam_id": cam_id,
-        "n_frames": n_frames,
-        "avg_poses": float(np.mean(pose_counts)) if pose_counts else 0.0,
-        "pose_distribution": {int(k): int(v) for k, v in
-                              zip(*np.unique(pose_counts, return_counts=True))} if pose_counts else {},
-        "out_path": str(out_path),
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -333,41 +340,45 @@ def main():
         json.dump(sync_offsets, f, indent=2)
     print(f"Saved to {sync_path}\n")
 
-    # --- Step 2: Pose detection (parallel — 3 cameras simultaneously) ---
-    print(f"=== Pose Detection — {len(cam_ids)} cameras in parallel ===\n")
+    # --- Step 2: Pose detection (sequential — YOLO doesn't work in forked subprocesses) ---
+    cfg_pose = cfg["pose_detection"]
+    num_persons = cfg_pose.get("num_poses", 2)
+    print(f"=== Pose Detection — {len(cam_ids)} cameras (sequential) ===\n")
 
-    result_queue: Queue = Queue()
-    processes = [
-        Process(target=_pose_worker, args=(
-            cam_id,
-            str(ROOT / cfg["cameras"][cam_id]["skeleton_video"]),
-            cfg["pose_detection"],
-            sync_offsets[cam_id],
-            str(output_dir),
-            result_queue,
-        ))
-        for cam_id in cam_ids
-    ]
-    for p in processes:
-        p.start()
-        print(f"  Started process for {cam_ids[processes.index(p)]}")
+    # Load models once in main process
+    yolo_model = YOLO(YOLO_MODEL, verbose=False)
+    landmarker = create_pose_detector(cfg_pose)
+    downscale = cfg_pose.get("downscale_width")
 
-    # Drain queue BEFORE join() to avoid pipe deadlock
-    num_persons = cfg["pose_detection"]["num_poses"]
-    for _ in cam_ids:
-        stats = result_queue.get()
-        cam_id = stats["cam_id"]
-        dist = stats["pose_distribution"]
-        # Frames where all expected persons are detected
+    for cam_id in cam_ids:
+        video_path = str(ROOT / cfg["cameras"][cam_id]["skeleton_video"])
+        print(f"\n--- {cam_id} ---")
+
+        result = detect_poses_in_video(
+            yolo_model, landmarker, video_path, cfg_pose["subsample_fps"],
+            sync_offsets[cam_id], cam_id=cam_id, downscale_width=downscale,
+            num_poses=num_persons,
+        )
+        result["camera_id"] = cam_id
+        result["video_path"] = video_path
+        result["sync_offset_s"] = sync_offsets[cam_id]
+
+        out_path = output_dir / f"{cam_id}_poses.json"
+        with open(out_path, "w") as f:
+            json.dump(result, f)
+
+        n_frames = result["total_frames_processed"]
+        pose_counts = [fr["num_poses"] for fr in result["frames"]]
+        dist = {int(k): int(v) for k, v in
+                zip(*np.unique(pose_counts, return_counts=True))} if pose_counts else {}
+        avg = float(np.mean(pose_counts)) if pose_counts else 0.0
         full_det = dist.get(num_persons, 0)
-        full_pct = 100 * full_det // max(1, stats["n_frames"])
-        print(f"\n[{cam_id}] {stats['n_frames']} frames | avg {stats['avg_poses']:.2f}/{num_persons} persons")
+        full_pct = 100 * full_det // max(1, n_frames)
+        print(f"  [{cam_id}] {n_frames} frames | avg {avg:.2f}/{num_persons} persons")
         print(f"  Distribution: {dist} | {full_pct}% frames with {num_persons} persons")
-        print(f"  Saved to {stats['out_path']}")
+        print(f"  Saved to {out_path}")
 
-    for p in processes:
-        p.join()
-
+    landmarker.close()
     print("\nDone.")
 
 
